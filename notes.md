@@ -7,8 +7,8 @@ Assuming you have usual git remotes setup. For example, on my machine:
 kpt-samples $ git remote -v
 origin  git@github.com:droot/kpt-samples.git (fetch)
 origin  git@github.com:droot/kpt-samples.git (push)
-upstream        git@github.com:googlecontainertools/kpt-samples.git (fetch)
-upstream        git@github.com:googlecontainertools/kpt-samples.git (push)
+upstream        git@github.com:kptdev/kpt-samples.git (fetch)
+upstream        git@github.com:kptdev/kpt-samples.git (push)
 ```
 
 Let say, your latest iteration on a package (say `ghost`) got merged.

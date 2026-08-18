@@ -17,7 +17,7 @@ Code is under the [Apache License 2.0](LICENSE), documentation is [CC BY 4.0](LI
 
 ## Governance
 
-The governance of the kpt project and KRM Functiona Catalog are described in the
+The governance of the kpt project and KRM Functions Catalog are described in the
 [governance repo](https://github.com/kptdev/governance).
 
 ## Code of Conduct
