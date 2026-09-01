@@ -9,7 +9,7 @@ Nginx Ingress Controller package
 ### Fetch the package
 
 ```sh
-kpt pkg get git@github.com:googlecontainertools/kpt.git/package-examples/ingress-nginx ingress-nginx
+kpt pkg get git@github.com:kptdev/kpt-samples.git/ingress-nginx ingress-nginx
 ```
 
 ### View package content
