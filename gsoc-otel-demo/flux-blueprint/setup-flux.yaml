@@ -1,0 +1,43 @@
+# setup-flux.yaml
+# Reads the flux-config ConfigMap (repo, namespace, appPath) and stamps those
+# values into the GitRepository and Flux Kustomization templates so this package,
+# once cloned per region, produces that region's Flux wiring.
+apiVersion: fn.kpt.dev/v1alpha1
+kind: StarlarkRun
+metadata:
+  name: setup-flux
+  annotations:
+    config.kubernetes.io/local-config: "true"
+source: |
+  def find_cfg(resources):
+    for r in resources:
+      m = r.get("metadata", {})
+      if r.get("kind") == "ConfigMap" and m.get("name", "") == "flux-config":
+        return r.get("data", {})
+    return {}
+
+  def setup_flux(resources):
+    cfg = find_cfg(resources)
+    repo = cfg.get("repo", "")
+    ns = cfg.get("namespace", "")
+    app_path = cfg.get("appPath", "gsoc-otel-demo")
+    if repo == "" or ns == "" or repo == "PLACEHOLDER-REPO":
+      return  # not customized yet; leave templates as-is
+
+    for r in resources:
+      kind = r.get("kind", "")
+      meta = r.get("metadata", {})
+      if kind == "GitRepository":
+        meta["name"] = repo
+        meta["namespace"] = ns
+        spec = r.get("spec", {})
+        spec["url"] = "http://172.18.255.204:3000/porch/" + repo + ".git"
+      elif kind == "Kustomization" and r.get("apiVersion", "").startswith("kustomize.toolkit.fluxcd.io"):
+        meta["name"] = ns
+        meta["namespace"] = ns
+        spec = r.get("spec", {})
+        ref = spec.get("sourceRef", {})
+        ref["name"] = repo
+        spec["path"] = "./" + app_path
+
+  setup_flux(ctx.resource_list["items"])

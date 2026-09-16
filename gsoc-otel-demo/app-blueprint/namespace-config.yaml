@@ -1,0 +1,13 @@
+# Single source of truth for the deployment namespace.
+# The blueprint ships a neutral default; each Porch deployment clone overrides
+# data.namespace (edit this value in the clone, or inject via PackageVariant),
+# and the pipeline re-renders so all resources land in that namespace and
+# cluster-scoped names are made unique per namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: namespace-config
+  annotations:
+    config.kubernetes.io/local-config: "true"
+data:
+  namespace: otel-demo

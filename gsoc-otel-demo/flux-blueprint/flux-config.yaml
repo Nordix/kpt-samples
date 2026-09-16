@@ -1,0 +1,14 @@
+# Single source of truth for one region's Flux wiring.
+# A deployment clone overrides data.repo / data.namespace (and appPath if the app
+# package name differs). The setup-flux mutator stamps these into the
+# GitRepository and Kustomization templates during render.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flux-config
+  annotations:
+    config.kubernetes.io/local-config: "true"
+data:
+  repo: PLACEHOLDER-REPO          # Gitea repo / Flux GitRepository name (e.g. sweden)
+  namespace: PLACEHOLDER-NS       # deployment namespace + Kustomization name (e.g. sweden-otel-demo)
+  appPath: gsoc-otel-demo         # path within the region repo where the app package lives

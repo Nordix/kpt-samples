@@ -1,0 +1,21 @@
+apiVersion: config.porch.kpt.dev/v1alpha1
+kind: Repository
+metadata:
+  name: hungary-flux-config
+  namespace: porch-demo
+  labels:
+    porch.porch.org/shard: "1"
+spec:
+  description: hungary flux
+  content: Package
+  deployment: true
+  type: git
+  git:
+    repo: http://172.18.255.204:3000/porch/hungary.git
+    directory: /flux-config
+    branch: main
+    createBranch: true
+    secretRef:
+      name: gitea
+  sync:
+    schedule: "* 4 * * *"

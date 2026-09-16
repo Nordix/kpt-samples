@@ -1,0 +1,20 @@
+# Flux Kustomization that applies the region's app package. name/source/path are
+# stamped from flux-config (namespace, repo, appPath) by the setup-flux mutator.
+# The app manifests already carry their own namespace (set-namespace in the app
+# package), so no targetNamespace is set here. prune:true so removing this file
+# from the flux-config package garbage-collects the deployment.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: PLACEHOLDER-NS
+  namespace: PLACEHOLDER-NS
+spec:
+  interval: 2m
+  retryInterval: 1m
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: PLACEHOLDER-REPO
+  path: ./PLACEHOLDER-APPPATH
+  prune: true
+  wait: false

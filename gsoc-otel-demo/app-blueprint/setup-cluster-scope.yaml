@@ -1,0 +1,190 @@
+# setup-cluster-scope.yaml
+# Makes the package deployable into an arbitrary namespace without cluster-scoped
+# name collisions between deployments.
+#
+# The upstream chart bakes the namespace into cluster-scoped resource names
+# (e.g. ClusterRole "otel-demo-prometheus") and into the otel-collector leader-election
+# lease ("lease_namespace: otel-demo"). set-namespace only rewrites metadata.namespace
+# and RoleBinding/CRB subject namespaces - it does NOT touch these two. This mutator
+# rewrites the baked-in "otel-demo" token to the target namespace so:
+#   - ClusterRole / ClusterRoleBinding names become "<ns>-..." (unique per deployment)
+#   - ClusterRoleBinding.roleRef keeps pointing at the renamed ClusterRole
+#   - the collector lease lands in the deployment namespace
+#
+# Target namespace is read from the root `namespace-config` ConfigMap (data.namespace),
+# which a Porch PackageVariant / per-clone edit overrides. If unset, no change is made.
+apiVersion: fn.kpt.dev/v1alpha1
+kind: StarlarkRun
+metadata:
+  name: setup-cluster-scope
+  annotations:
+    config.kubernetes.io/local-config: "true"
+source: |
+  BASE = "otel-demo"
+
+  def find_namespace(resources):
+    for r in resources:
+      meta = r.get("metadata", {})
+      if r.get("kind") == "ConfigMap" and meta.get("name", "") == "namespace-config":
+        return r.get("data", {}).get("namespace", "")
+    return ""
+
+  def rename(name, ns):
+    # normalize a baked-in "otel-demo-" prefix to "<ns>-"; otherwise prefix "<ns>-".
+    if name == "":
+      return name
+    if ns == BASE:
+      return name
+    if name.startswith(BASE + "-"):
+      return ns + "-" + name[len(BASE) + 1:]
+    if name.startswith(ns + "-"):
+      return name  # already normalized (idempotent)
+    return ns + "-" + name
+
+  def rename_cluster_scoped(resources, ns):
+    cluster_kinds = ["ClusterRole", "ClusterRoleBinding"]
+    for r in resources:
+      kind = r.get("kind", "")
+      if kind not in cluster_kinds:
+        continue
+      meta = r.get("metadata", {})
+      meta["name"] = rename(meta.get("name", ""), ns)
+      if kind == "ClusterRoleBinding":
+        ref = r.get("roleRef", {})
+        if ref.get("kind") == "ClusterRole":
+          ref["name"] = rename(ref.get("name", ""), ns)
+
+  def fix_collector_lease_ns(resources, ns):
+    for r in resources:
+      if r.get("kind") != "ConfigMap":
+        continue
+      if r.get("metadata", {}).get("name", "") != "otel-collector-agent":
+        continue
+      data = r.get("data", {})
+      relay = data.get("relay", "")
+      old = "lease_namespace: " + BASE
+      if relay != "" and old in relay:
+        data["relay"] = relay.replace(old, "lease_namespace: " + ns)
+
+  def strip_collector_hostports(resources):
+    # The otel-collector-agent DaemonSet declares hostPorts (4317/4318/6831/...).
+    # In-cluster workloads reach the collector via the ClusterIP Service DNS name
+    # (http://otel-collector:4317), NOT via node hostPorts, so the hostPorts are
+    # unused here. Removing them lets multiple agents (one per deployment namespace)
+    # schedule on a single-node cluster without hostPort collisions.
+    for r in resources:
+      if r.get("kind") != "DaemonSet":
+        continue
+      if r.get("metadata", {}).get("name", "") != "otel-collector-agent":
+        continue
+      containers = r.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+      for c in containers:
+        for p in c.get("ports", []):
+          if "hostPort" in p:
+            p.pop("hostPort")
+
+  def unlimit_flagd_ui(resources):
+    # The flagd-ui sidecar image sizes its heap to the cgroup memory LIMIT and
+    # OOMKills at startup whenever a hard limit is set (fails at 300Mi/512Mi/1Gi).
+    # With no memory limit it sizes to available memory and runs fine. Strip any
+    # memory limit on the flagd-ui container so the optional admin UI starts.
+    for r in resources:
+      if r.get("kind") != "Deployment":
+        continue
+      if r.get("metadata", {}).get("name", "") != "flagd":
+        continue
+      spec = r.get("spec", {}).get("template", {}).get("spec", {})
+      for c in spec.get("containers", []):
+        if c.get("name") == "flagd-ui":
+          res = c.get("resources", None)
+          if res and "limits" in res and res["limits"] and "memory" in res["limits"]:
+            res["limits"].pop("memory")
+            if not res["limits"]:
+              res.pop("limits")
+            if not res:
+              c.pop("resources")
+
+  def bump_loadgen_memory(resources):
+    # The load-generator (Locust) OOMKills at the upstream 1500Mi limit shortly
+    # after start. Raise its limit to 2Gi (and clear the memory request so it can
+    # schedule) so it runs steadily. Adjust LOCUST_USERS to reduce load if needed.
+    for r in resources:
+      if r.get("kind") != "Deployment":
+        continue
+      if r.get("metadata", {}).get("name", "") != "load-generator":
+        continue
+      spec = r.get("spec", {}).get("template", {}).get("spec", {})
+      for c in spec.get("containers", []):
+        if c.get("name") == "load-generator":
+          res = c.setdefault("resources", {})
+          res.setdefault("limits", {})["memory"] = "2Gi"
+
+  def clean_empty_volumes(resources):
+    # Upstream deployments carry `volumes: null` / `volumeMounts: null`. Porch's
+    # YAML round-trip serializes these to `{}` (empty MAP), which is invalid for
+    # these list-typed fields and makes Flux's server-side-apply dry-run fail
+    # ("expected list, got map[]"). Drop the empty/null keys entirely so they are
+    # simply absent.
+    kinds = ["Deployment", "StatefulSet", "DaemonSet"]
+    for r in resources:
+      if r.get("kind", "") not in kinds:
+        continue
+      pod = r.get("spec", {}).get("template", {}).get("spec", {})
+      if not pod:
+        continue
+      vols = pod.get("volumes", "keep")
+      if vols == None or vols == {} or vols == []:
+        if "volumes" in pod:
+          pod.pop("volumes")
+      for c in pod.get("containers", []) + pod.get("initContainers", []):
+        vm = c.get("volumeMounts", "keep")
+        if vm == None or vm == {} or vm == []:
+          if "volumeMounts" in c:
+            c.pop("volumeMounts")
+
+  def clean_empty_strategy(resources):
+    # `strategy.rollingUpdate: null` in source becomes `{}` after Porch's YAML
+    # round-trip. With `strategy.type: Recreate`, Kubernetes forbids rollingUpdate
+    # being present at all ("may not be specified when strategy type is Recreate").
+    # Drop empty/null rollingUpdate so it is absent.
+    for r in resources:
+      if r.get("kind", "") != "Deployment":
+        continue
+      strat = r.get("spec", {}).get("strategy", None)
+      if not strat:
+        continue
+      ru = strat.get("rollingUpdate", "keep")
+      if ru == None or ru == {}:
+        if "rollingUpdate" in strat:
+          strat.pop("rollingUpdate")
+
+  def set_namespace_object(resources, ns):
+    # Rewrite the placeholder Namespace object's name to the target namespace so
+    # the package ships its own Namespace (created/pruned by Flux). set-namespace
+    # does not touch Namespace names, so we do it here.
+    for r in resources:
+      if r.get("kind") == "Namespace":
+        meta = r.get("metadata", {})
+        if meta.get("name", "") == "PLACEHOLDER-NS" or meta.get("name", "") != ns:
+          # only rewrite our placeholder / stale value; leave unrelated NS objects alone
+          if meta.get("name", "") in ("PLACEHOLDER-NS", BASE) or meta.get("name","").endswith("-otel-demo"):
+            meta["name"] = ns
+
+  def setup_cluster_scope(resources):
+    # namespace-independent adjustments
+    clean_empty_volumes(resources)
+    clean_empty_strategy(resources)
+    strip_collector_hostports(resources)
+    unlimit_flagd_ui(resources)
+    bump_loadgen_memory(resources)
+    ns = find_namespace(resources)
+    if ns == "":
+      return
+    # always set the Namespace object's name (including for the base namespace)
+    set_namespace_object(resources, ns)
+    if ns == BASE:
+      return
+    rename_cluster_scoped(resources, ns)
+    fix_collector_lease_ns(resources, ns)
+
+  setup_cluster_scope(ctx.resource_list["items"])

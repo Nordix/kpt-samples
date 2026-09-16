@@ -1,0 +1,14 @@
+# Flux source for one region repo. name/url are stamped from flux-config
+# (data.repo) by the setup-flux mutator. Lives in flux-system.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: PLACEHOLDER-REPO
+  namespace: PLACEHOLDER-NS
+spec:
+  interval: 1m
+  url: http://172.18.255.204:3000/porch/PLACEHOLDER-REPO.git
+  ref:
+    branch: main
+  secretRef:
+    name: gitea
