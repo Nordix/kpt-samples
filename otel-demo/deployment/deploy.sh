@@ -361,6 +361,10 @@ INTERACTIVE="${INTERACTIVE:-0}"
 AUTO="${AUTO:-0}"
 STEP_DELAY="${STEP_DELAY:-2}"
 _STEP_NO=0
+# Optional --store <astronomy|florist> captured by the global flag pre-parser so it
+# works for the deploy command regardless of position (deploy also accepts store as
+# a positional arg; the flag wins if both are given).
+STORE_FLAG="${STORE_FLAG:-}"
 
 # ANSI helpers (only colorize when writing to a TTY).
 if [[ -t 2 ]]; then
@@ -821,10 +825,26 @@ upgrade_region() {  # upgrade_region <region> [app-blueprint-rev] [store] [do-fl
 
   local apr; apr="$(upgrade_pkg "$apps_repo" "$PACKAGE_NAME" "$BLUEPRINT_NAME" "$target_rev" || true)"
   if [[ -n "$apr" ]]; then
-    # If a store was requested, re-stamp storeType on the upgraded draft before publishing.
+    # Pull the upgraded draft to (1) increment the render-time `version` counter so
+    # ALL pods restart on this upgrade, and (2) optionally re-stamp storeType.
+    local tmp; tmp="$(mktemp -d)"; local work="$tmp/pkg"
+    p rpkg pull "$apr" "$work" >/dev/null
+
+    # Bump version counter (version-config.yaml) → bump_versioned_memory adds
+    # version*1Mi to every container on render, forcing a restart of all pods.
+    if [[ -f "$work/version-config.yaml" ]]; then
+      local _cur _next
+      _cur="$(grep -E '^[[:space:]]*version:' "$work/version-config.yaml" | head -1 | sed -E 's/.*version:[[:space:]]*"?([0-9]+)"?.*/\1/')"
+      [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
+      _next=$(( _cur + 1 ))
+      log "  bumping restart version $_cur -> $_next on $apr"
+      sed -i -E "s|^([[:space:]]*)version:.*|\1version: \"$_next\"|" "$work/version-config.yaml"
+    else
+      warn "  version-config.yaml not found in $apr; skipping restart-version bump (blueprint may predate it)"
+    fi
+
+    # If a store was requested, re-stamp storeType on the upgraded draft too.
     if [[ -n "$store" ]]; then
-      local tmp; tmp="$(mktemp -d)"; local work="$tmp/pkg"
-      p rpkg pull "$apr" "$work" >/dev/null
       if [[ -f "$work/app-config.yaml" ]]; then
         log "  setting storeType=$store on $apr"
         # Handle both block style (`storeType: x` on its own line) and flow style
@@ -833,12 +853,13 @@ upgrade_region() {  # upgrade_region <region> [app-blueprint-rev] [store] [do-fl
           -e "s|^\([[:space:]]*\)storeType:.*|\1storeType: $store|" \
           -e "s|\(storeType:[[:space:]]*\)[a-zA-Z-]*|\1$store|" \
           "$work/app-config.yaml"
-        p rpkg push "$apr" "$work" >/dev/null
       else
         warn "  app-config.yaml not found in $apr; cannot set store"
       fi
-      rm -rf "$tmp"
     fi
+
+    p rpkg push "$apr" "$work" >/dev/null
+    rm -rf "$tmp"
     publish "$apr" && log "  app upgraded + published: $apr"
   fi
 
@@ -1108,33 +1129,10 @@ open(p, "w").write(s2)
 PY
   fi
 
-  # --- vX edit 4: bump flagd + checkout memory by +10Mi each version. Because
-  # setup_profile resets memory from UPSTREAM_MEMORY_LIMITS on every render, the
-  # bump is applied THERE (not on the raw deployment, which would be overwritten).
-  # Each version adds +10Mi, so the value strictly increases (v2=310/110,
-  # v3=320/120, …). The changing pod spec forces flagd + checkout to RESTART on
-  # every 'upgrade', which clears flagd's stale in-memory config and checkout's
-  # stuck gRPC name resolver.
-  if [[ -f "$work/setup-extras.yaml" ]]; then
-    log "Bumping flagd + checkout memory by 10Mi (forces restart on upgrade)"
-    python3 - "$work/setup-extras.yaml" <<'PY'
-import re, sys
-p = sys.argv[1]
-s = open(p).read()
-def bump(text, svc, delta=10):
-    # match e.g.  "flagd": "300Mi",  and add delta to the number
-    pat = re.compile(r'("' + re.escape(svc) + r'":\s*")(\d+)(Mi")')
-    def repl(m):
-        return m.group(1) + str(int(m.group(2)) + delta) + m.group(3)
-    new, n = pat.subn(repl, text, count=1)
-    if n == 0:
-        sys.stderr.write("WARN: UPSTREAM_MEMORY_LIMITS entry for %s not found\n" % svc)
-    return new
-s = bump(s, "flagd")
-s = bump(s, "checkout")
-open(p, "w").write(s)
-PY
-  fi
+  # NOTE: the old flagd/checkout +10Mi memory bump was removed. Forcing pod
+  # restarts on upgrade is now handled uniformly for ALL pods by the render-time
+  # `version` counter (version-config ConfigMap + bump_versioned_memory in
+  # setup-extras.yaml), which deploy.sh increments on each upgrade.
 
   if interactive && [[ -n "$work_orig" ]]; then
     show_diff "$ws changes (chaos removed + flagd/checkout +10Mi) vs previous" "$work_orig" "$work"
@@ -2124,6 +2122,8 @@ while [[ $# -gt 0 ]]; do
                       GIT_BACKEND="${2:-}"; GIT_BACKEND_EXPLICIT=1; shift ;;
     --gitBackend=*|--git-backend=*)
                       GIT_BACKEND="${1#*=}"; GIT_BACKEND_EXPLICIT=1 ;;
+    --store)          STORE_FLAG="${2:-}"; shift ;;
+    --store=*)        STORE_FLAG="${1#*=}" ;;
     *)                _args+=("$1") ;;
   esac
   shift
@@ -2158,7 +2158,10 @@ case "$cmd" in
   blueprint)  push_blueprint ;;
   blueprint-fixed|blueprint-vX) push_blueprint_fixed ;;
   flux-blueprint) push_flux_blueprint ;;
-  deploy)     [[ $# -ge 1 ]] || die "usage: $0 deploy <region> [store]"; deploy_target "$@" ;;
+  deploy)     [[ $# -ge 1 ]] || die "usage: $0 deploy <region> [store] | [--store <astronomy|florist>]"
+              _dt_region="$1"; shift || true
+              # --store flag wins; else use the positional store ($1) if present.
+              deploy_target "$_dt_region" "${STORE_FLAG:-${1:-astronomy}}" ;;
   flux-init)  flux_init ;;
   flux-bootstrap) flux_bootstrap ;;
   status)     status ;;
@@ -2246,7 +2249,8 @@ case "$cmd" in
   -*) die "unknown option '$cmd' (run '$0 help')" ;;
   *)
     # Fallback: treat an unrecognized first arg as a region to deploy, so you can
-    # write `./deploy.sh ireland` or `./deploy.sh ireland florist`.
-    deploy_target "$cmd" "$@"
+    # write `./deploy.sh ireland`, `./deploy.sh ireland florist`, or
+    # `./deploy.sh ireland --store florist` (flag captured globally, wins over positional).
+    deploy_target "$cmd" "${STORE_FLAG:-${1:-astronomy}}"
     ;;
 esac
