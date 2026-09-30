@@ -1,0 +1,78 @@
+# setup-flux.yaml
+# Reads the flux-config ConfigMap (repo, namespace, appPath) and stamps those
+# values into the GitRepository and Flux Kustomization templates so this package,
+# once cloned per region, produces that region's Flux wiring.
+apiVersion: fn.kpt.dev/v1alpha1
+kind: StarlarkRun
+metadata:
+  name: setup-flux
+  annotations:
+    config.kubernetes.io/local-config: "true"
+source: |
+  def find_cfg(resources):
+    for r in resources:
+      m = r.get("metadata", {})
+      if r.get("kind") == "ConfigMap" and m.get("name", "") == "flux-config":
+        return r.get("data", {})
+    return {}
+
+  # Rewrite kpt's upstream-identifier annotation to match the stamped identity.
+  # Format: "<apiGroup>|<kind>|<namespace>|<name>" (apiGroup is apiVersion minus
+  # the trailing "/<version>"). Keeps the tracking metadata consistent with the
+  # rendered resource instead of the PLACEHOLDER-* upstream identity.
+  def set_upstream_identifier(r, ns, name):
+    api = r.get("apiVersion", "")
+    group = api.split("/")[0] if "/" in api else api
+    kind = r.get("kind", "")
+    meta = r.get("metadata", {})
+    ann = meta.get("annotations", {})
+    ann["internal.kpt.dev/upstream-identifier"] = group + "|" + kind + "|" + ns + "|" + name
+    meta["annotations"] = ann
+
+  def setup_flux(resources):
+    cfg = find_cfg(resources)
+    repo = cfg.get("repo", "")
+    ns = cfg.get("namespace", "")
+    app_path = cfg.get("appPath", "otel-demo")
+    kubeconfig_secret = cfg.get("kubeconfigSecret", "")
+    # Git auth secret name for the GitRepository (Flux source). Backend-dependent:
+    # 'gitea' for Gitea, 'gitlab-local' for GitLab. Defaults to gitea for back-compat.
+    git_secret = cfg.get("gitSecret", "gitea")
+    # Git server base (e.g. http://<host>:3000/porch); url = <git_base>/<repo>.git.
+    # Falls back to the in-cluster default if the config doesn't set it.
+    git_base = cfg.get("gitBase", "http://172.18.255.204:3000/porch")
+    if git_base.endswith("/"):
+      git_base = git_base[:-1]
+    if repo == "" or ns == "" or repo == "PLACEHOLDER-REPO":
+      return  # not customized yet; leave templates as-is
+
+    for r in resources:
+      kind = r.get("kind", "")
+      meta = r.get("metadata", {})
+      if kind == "GitRepository":
+        meta["name"] = repo
+        meta["namespace"] = ns
+        set_upstream_identifier(r, ns, repo)
+        spec = r.get("spec", {})
+        spec["url"] = git_base + "/" + repo + ".git"
+        # Point the source at the correct git auth secret for the backend.
+        sref = spec.get("secretRef", {})
+        sref["name"] = git_secret
+        spec["secretRef"] = sref
+      elif kind == "Kustomization" and r.get("apiVersion", "").startswith("kustomize.toolkit.fluxcd.io"):
+        meta["name"] = ns
+        meta["namespace"] = ns
+        set_upstream_identifier(r, ns, ns)
+        spec = r.get("spec", {})
+        ref = spec.get("sourceRef", {})
+        ref["name"] = repo
+        spec["path"] = "./" + app_path
+        # remote-apply: target the region cluster via its kubeconfig secret
+        if kubeconfig_secret != "" and kubeconfig_secret != "PLACEHOLDER-KUBECONFIG":
+          spec["kubeConfig"] = {"secretRef": {"name": kubeconfig_secret, "key": "value"}}
+        else:
+          # no target cluster set -> apply locally (drop the placeholder kubeConfig)
+          if "kubeConfig" in spec:
+            spec.pop("kubeConfig")
+
+  setup_flux(ctx.resource_list["items"])

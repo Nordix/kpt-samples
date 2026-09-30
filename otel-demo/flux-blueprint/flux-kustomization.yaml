@@ -1,0 +1,24 @@
+# Flux Kustomization that applies the region's app package to the REGION cluster.
+# name/source/path/kubeConfig are stamped from flux-config by the setup-flux mutator.
+# The app manifests carry their own namespace (set-namespace in the app package),
+# so no targetNamespace here. kubeConfig.secretRef points Flux at the remote
+# (region) cluster. prune:true so removing this file garbage-collects the deployment.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: PLACEHOLDER-NS
+  namespace: PLACEHOLDER-NS
+spec:
+  interval: 2m
+  retryInterval: 1m
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: PLACEHOLDER-REPO
+  path: ./PLACEHOLDER-APPPATH
+  prune: true
+  wait: false
+  kubeConfig:
+    secretRef:
+      name: PLACEHOLDER-KUBECONFIG
+      key: value

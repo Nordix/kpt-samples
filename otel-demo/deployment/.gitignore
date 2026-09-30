@@ -1,0 +1,3 @@
+# Cached GitLab Personal Access Token provisioned by deploy.sh (--gitBackend gitlab).
+# This is a secret — never commit it.
+.gitlab-token

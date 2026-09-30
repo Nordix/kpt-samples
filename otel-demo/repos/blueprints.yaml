@@ -1,0 +1,21 @@
+apiVersion: config.porch.kpt.dev/v1alpha1
+kind: Repository
+metadata:
+  name: blueprints
+  namespace: porch-demo
+  labels:
+    porch.porch.org/shard: "0"
+spec:
+  description: staging
+  content: Package
+  deployment: false
+  type: git
+  git:
+    repo: http://172.18.255.204:3000/porch/blueprints.git
+    directory: /
+    branch: main
+    createBranch: true
+    secretRef:
+      name: gitea
+  sync:
+    schedule: "0 2 * * *"

@@ -7,8 +7,6 @@
 #
 #   namespace  Target Kubernetes namespace for the whole deployment.
 #   storeType  Store branding: astronomy | florist
-#   imageSource  Which branded images to use: upstream (prebuilt ghcr.io images,
-#                default) | local (locally-built images from scripts/build_and_load.sh)
 #   region     Locale/currency/tax region: us | india | czech-republic | china |
 #              ireland | sweden | hungary
 #   profile    Resource-scaling profile: default | small | medium | large
@@ -23,7 +21,6 @@ metadata:
 data:
   namespace: otel-demo
   storeType: astronomy
-  imageSource: upstream
   region: us
-  profile: small
+  profile: default
   chaos: payment-outage
