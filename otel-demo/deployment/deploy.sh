@@ -1313,7 +1313,7 @@ deploy_target() {  # deploy_target <region> [store]
   # GitOps: publish the region's Flux wiring package into <region>-flux-config.
   add_flux_config "$region" "$ns" "$kubeconfig_secret"
   # Seed the per-region Flux root that watches <region>.git /flux-config.
-  flux_bootstrap_region "$region"
+  flux_wire_region "$region"
 
   deploy_summary "$region" "$ns" "$store"
 }
@@ -1678,11 +1678,11 @@ EOF
 # Flux config as a Porch package (GitOps).
 #   - flux-config package holds one GitRepository (the deployments repo) + one
 #     Kustomization per deployment package.
-#   - a single root Kustomization ('flux-bootstrap', created once) watches the
+#   - a per-region root Kustomization ('<region>-flux', created once) watches the
 #     flux-config repo and applies whatever it finds.
 #   Adding a deployment => add a Kustomization file to the flux-config package
-#   as its own package (named <repo>) in the flux-config repo. A single root
-#   Kustomization ('flux-bootstrap') watches the flux-config repo root and applies
+#   as its own package (named <repo>) in the flux-config repo. The per-region root
+#   Kustomization ('<region>-flux') watches the flux-config repo root and applies
 #   every region package.  No imperative kubectl for wiring.
 # ---------------------------------------------------------------------------
 
@@ -1735,25 +1735,29 @@ EOF
   rm -rf "$tmp"
   log "flux wiring package published: $pr (in $flux_repo -> /flux-config)"
 
-  # nudge the region's root Kustomization to pick it up promptly (if bootstrap exists)
+  # nudge the region's root Kustomization to pick it up promptly (if the root exists)
   flux reconcile kustomization "${region}-flux" -n "$ns" --with-source >/dev/null 2>&1 || true
 }
 
-# Per-region bootstrap: a root GitRepository + Kustomization that watches the
+# Per-region wiring: a root GitRepository + Kustomization that watches the
 # region repo's /flux-config dir. That dir (published above) contains the region's
 # Flux wiring, which in turn applies /apps. One seed per region.
-flux_bootstrap_region() {  # flux_bootstrap_region <region>
+#
+# NOTE: this does NOT use the `flux bootstrap` CLI command (which installs Flux
+# and commits its own manifests to git). It directly applies a GitRepository +
+# Kustomization — Flux is installed separately by flux_init.
+flux_wire_region() {  # flux_wire_region <region>
   require flux; require kubectl
   local region; region="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   local ns="${region}-otel-demo"
-  step "Bootstrap Flux root for '$region'"
+  step "Wire up the Flux root for '$region'"
   explain "The final handoff: a root GitRepository + Kustomization ('${region}-flux')" \
           "that watches $region.git → /flux-config. That wiring in turn reconciles" \
           "/apps onto the region cluster. From here on it's pure GitOps — republish" \
           "a package and Flux converges the cluster automatically." \
           "" \
           "Namespace (holds the Flux objects, on mgmt cluster): $ns"
-  log "Bootstrapping Flux root for $region in ns $ns (watches $region.git /flux-config)"
+  log "Wiring up Flux root for $region in ns $ns (watches $region.git /flux-config)"
 
   # The Flux objects live in the deployment namespace, so ensure it exists and
   # that source-controller can read the git secret from there.
@@ -1807,14 +1811,14 @@ EOF
   fi
 }
 
-# Global bootstrap: install Flux + secret, and ensure the flux blueprint is
+# Global setup: install Flux + secret, and ensure the flux blueprint is
 # published (each region clones it). Per-region roots are created during deploy
-# via flux_bootstrap_region.
-flux_bootstrap() {
+# via flux_wire_region.
+flux_setup() {
   require flux; require kubectl
   flux_init
   [[ -n "$(latest_blueprint_rev "$FLUX_BLUEPRINT_NAME")" ]] || push_flux_blueprint
-  log "Global bootstrap complete (Flux installed, secret + flux-blueprint ready)."
+  log "Global setup complete (Flux installed, secret + flux-blueprint ready)."
 }
 
 
@@ -1916,7 +1920,8 @@ Advanced (normally run automatically by a deploy — rarely needed directly):
                        'upgrade <region>' rolls a region to it. (alias: blueprint-vX)
   flux-blueprint       Publish local flux-blueprint/ to '$BLUEPRINT_REPO'
   flux-init            Install Flux controllers + create/replicate the git secret
-  flux-bootstrap       flux-init + ensure the flux blueprint is published
+  flux-setup           flux-init + ensure the flux blueprint is published
+                       (alias: flux-bootstrap)
 
 GitOps model: per region there is ONE Gitea repo with two dirs — /apps (the shop,
 from app-blueprint) and /flux-config (the Flux wiring, from flux-blueprint), each a
@@ -2163,7 +2168,7 @@ case "$cmd" in
               # --store flag wins; else use the positional store ($1) if present.
               deploy_target "$_dt_region" "${STORE_FLAG:-${1:-astronomy}}" ;;
   flux-init)  flux_init ;;
-  flux-bootstrap) flux_bootstrap ;;
+  flux-setup|flux-bootstrap) flux_setup ;;
   status)     status ;;
   upgrade|update)
     [[ $# -ge 1 ]] || die "usage: $0 upgrade <region> [--revision <n>] [--store <astronomy|florist>] [--flux]"
@@ -2239,7 +2244,7 @@ case "$cmd" in
     ;;
   all)
     push_blueprint
-    flux_bootstrap
+    flux_setup
     deploy_target ireland
     deploy_target sweden
     deploy_target hungary
