@@ -383,7 +383,8 @@ source: |
     if scenario == None:
       scenario = "off"
     if scenario == "":
-      fail("chaos cannot be empty in app-config")
+      # chaos is optional; absent/empty means no chaos.
+      scenario = "off"
 
     # Define the chaos mapping
     chaos_matrix = {

@@ -17,7 +17,6 @@ spec:
     - storeType
     - region
     - profile
-    - chaos
   properties:
     namespace:
       type: string

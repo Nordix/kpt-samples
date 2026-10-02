@@ -1614,7 +1614,7 @@ ensure_gitlab_webhook() {  # ensure_gitlab_webhook <repo>
 # Repository `type:` follows the selected backend (git for Gitea, gitlab for
 # GitLab) — set in $GIT_TYPE by apply_git_backend.
 ensure_repo_registered() {  # ensure_repo_registered <porch-name> <git-repo> <directory> [deployment]
-  local name="$1" git_repo="$2" dir="$3" deployment="${4:-true}"
+  local name="$1" git_repo="$2" dir="$3" deployment="${4:-false}"
   local want_url="$GIT_BASE/$git_repo.git"
   if kubectl get repository "$name" -n "$PORCH_NS" >/dev/null 2>&1; then
     local cur_type cur_url cur_secret
@@ -1644,7 +1644,7 @@ ensure_repo_registered() {  # ensure_repo_registered <porch-name> <git-repo> <di
     kubectl delete repository "$name" -n "$PORCH_NS" --ignore-not-found >/dev/null 2>&1 || true
     sleep 2
   fi
-  log "Registering Porch repository '$name' -> $git_repo.git $dir (type=$GIT_TYPE deployment=$deployment)"
+  log "Registering Porch repository '$name' -> $git_repo.git $dir (type=$GIT_TYPE)"
   kubectl apply -f - >/dev/null <<EOF
 apiVersion: config.porch.kpt.dev/v1alpha1
 kind: Repository

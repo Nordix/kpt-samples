@@ -8,7 +8,7 @@ metadata:
 spec:
   description: sweden apps
   content: Package
-  deployment: true
+  deployment: false
   type: git
   git:
     repo: http://172.18.255.204:3000/porch/sweden.git
