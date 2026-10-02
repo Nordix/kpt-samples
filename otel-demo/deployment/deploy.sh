@@ -2172,7 +2172,10 @@ case "$cmd" in
   status)     status ;;
   upgrade|update)
     [[ $# -ge 1 ]] || die "usage: $0 upgrade <region> [--revision <n>] [--store <astronomy|florist>] [--flux]"
-    _region=""; _rev=""; _store=""; _flux=0
+    # --store is captured by the global pre-parser into STORE_FLAG (and stripped
+    # from the args), so seed _store from it. The local --store case below is a
+    # fallback in case the global parser ever stops consuming it.
+    _region=""; _rev=""; _store="${STORE_FLAG:-}"; _flux=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --revision) _rev="${2:-}"; shift 2 ;;
