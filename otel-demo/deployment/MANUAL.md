@@ -16,7 +16,7 @@ Per region there is **one Gitea repo** with **two directories**, each a Porch pa
 
 ```
 <region>.git
-├── /apps          -> Porch repo "<region>-apps"         (the shop, from app-blueprint)
+├── /apps          -> Porch repo "<region>-apps"         (the shop, from kpt-pkg)
 └── /flux-config   -> Porch repo "<region>-flux-config"  (Flux wiring, from flux-blueprint)
 
 MANAGEMENT cluster (all Flux + Porch objects live here, in ns <region>-otel-demo):
@@ -32,7 +32,7 @@ kind, both clusters share the `kind` docker network, so we point the kubeconfig 
 the region control-plane's container IP (which is a cert SAN, so TLS verifies).
 
 Two blueprints live in the `blueprints` repo:
-- `otel-demo-blueprint`  (from `app-blueprint/`)  — the shop app
+- `otel-demo-blueprint`  (from `kpt-pkg/`)  — the shop app
 - `flux-blueprint`            (from `flux-blueprint/`) — the Flux wiring template (carries kubeConfig)
 
 Prereqs: a management cluster with Porch installed, plus `kubectl`, `porchctl`,
@@ -55,7 +55,7 @@ then `export` them in the shell you'll run the rest of the runbook in.
 
 ```bash
 # --- where you cloned/copied this project ---
-# REPO must be the repository ROOT — the directory that contains app-blueprint/,
+# REPO must be the repository ROOT — the directory that contains kpt-pkg/,
 # flux-blueprint/, astronomy/, florist/, deployment/. If you're in deployment/,
 # set it to the parent, e.g.  export REPO=$(cd .. && pwd)  or  export REPO=~/otel-demo
 export REPO=$(pwd)                       # run this from the repo root, or override below
@@ -207,13 +207,13 @@ content → push (server-side render) → propose → approve.
 
 ### 3a. App blueprint (has subpackages shop/ + observability/)
 
-`$REPO` must be the repo root (the directory that contains `app-blueprint/`).
+`$REPO` must be the repo root (the directory that contains `kpt-pkg/`).
 The `&&` chaining is deliberate: if the copy fails (e.g. wrong `$REPO`), it stops
 **before** pushing/approving, so you never publish an empty blueprint.
 
 ```bash
 # sanity: $REPO must contain the source blueprint dir
-test -d "$REPO/app-blueprint" || { echo "ERROR: \$REPO ($REPO) has no app-blueprint/ — set REPO to the repo root"; }
+test -d "$REPO/kpt-pkg" || { echo "ERROR: \$REPO ($REPO) has no kpt-pkg/ — set REPO to the repo root"; }
 
 porchctl rpkg init "$APP_BLUEPRINT" --repository="$BLUEPRINT_REPO" \
   --workspace=v1 -n "$PORCH_NS"
@@ -221,7 +221,7 @@ porchctl rpkg init "$APP_BLUEPRINT" --repository="$BLUEPRINT_REPO" \
 DRAFT=${BLUEPRINT_REPO}.${APP_BLUEPRINT}.v1
 rm -rf /tmp/bp \
   && porchctl rpkg pull "$DRAFT" /tmp/bp -n "$PORCH_NS" \
-  && cp -r "$REPO/app-blueprint/." /tmp/bp/ \
+  && cp -r "$REPO/kpt-pkg/." /tmp/bp/ \
   && porchctl rpkg push    "$DRAFT" /tmp/bp -n "$PORCH_NS" \
   && porchctl rpkg propose "$DRAFT" -n "$PORCH_NS" \
   && porchctl rpkg approve "$DRAFT" -n "$PORCH_NS"

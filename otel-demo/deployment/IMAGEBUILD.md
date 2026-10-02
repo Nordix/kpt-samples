@@ -144,7 +144,7 @@ environment overrides by the script.
 
 If you fork or mirror the images elsewhere, set `IMAGE_REGISTRY` when building and
 update the references the package uses (the branding value-store / setup-branding
-in `app-blueprint/branding/`), then republish the blueprint:
+in `kpt-pkg/branding/`), then republish the blueprint:
 
 ```bash
 ./deploy.sh blueprint

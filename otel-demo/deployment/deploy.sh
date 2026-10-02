@@ -7,7 +7,7 @@
 #                 (ghcr.io/kptdev/kpt-samples/otel-demo/*) and pulled by the
 #                 workload clusters. Building + kind-loading them locally is
 #                 optional (`build` command, or BUILD_LOCAL=1 during a deploy).
-#   2. blueprint  Push the local app-blueprint/ package to the blueprints repo and publish it
+#   2. blueprint  Push the local kpt-pkg/ package to the blueprints repo and publish it
 #   3. deploy     Clone the blueprint into a deployments repo, set namespace + branding,
 #                 publish, then create the Flux GitRepository + Kustomization
 #   4. flux-init  Install Flux + replicate the git auth secret into flux-system
@@ -27,7 +27,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # the deployment/ folder (where this script lives)
-BLUEPRINT_DIR="${BLUEPRINT_DIR:-$REPO_ROOT/app-blueprint}"
+BLUEPRINT_DIR="${BLUEPRINT_DIR:-$REPO_ROOT/kpt-pkg}"
 FLUX_BLUEPRINT_DIR="${FLUX_BLUEPRINT_DIR:-$REPO_ROOT/flux-blueprint}"
 PACKAGE_NAME="${PACKAGE_NAME:-otel-demo}"          # app package name inside <region>-apps repo
 FLUX_PKG_NAME="${FLUX_PKG_NAME:-flux}"                  # flux package name inside <region>-flux-config repo
@@ -389,16 +389,23 @@ resolve_blueprint_repo() {
   esac
 }
 
-# reregister_blueprint_repo_if_stale — if the resolved blueprints Repository exists
-# but its git URL no longer matches the current GIT_BASE (e.g. the Gitea LB IP
-# changed), re-register it so Porch can reach it again. The backing Gitea repo
-# name equals BLUEPRINT_REPO and it lives at directory '/'. No-op when the repo is
-# absent (nothing to repoint) or already current (ensure_repo_registered reuses).
+# reregister_blueprint_repo_if_stale — if the resolved blueprints Repository is on
+# the SAME backend type as the current one but its git URL no longer matches
+# GIT_BASE (e.g. the Gitea LB IP changed), re-register it so Porch can reach it
+# again. The backing repo name equals BLUEPRINT_REPO and it lives at directory '/'.
+#
+# IMPORTANT: blueprints are backend-AGNOSTIC — a gitea blueprints repo may serve a
+# gitlab region (and vice-versa), cloned via Porch. So a DIFFERENT backend type is
+# NOT stale and must be left as-is (no-op), matching the "reuse blueprints repo"
+# rule. Only a same-type URL change (IP/host moved) is a real repoint.
 reregister_blueprint_repo_if_stale() {
   command -v kubectl >/dev/null 2>&1 || return 0
   kubectl get repository "$BLUEPRINT_REPO" -n "$PORCH_NS" >/dev/null 2>&1 || return 0
-  local cur_url want_url
+  local cur_type cur_url want_url
+  cur_type="$(kubectl get repository "$BLUEPRINT_REPO" -n "$PORCH_NS" -o jsonpath='{.spec.type}' 2>/dev/null || true)"
   cur_url="$(kubectl get repository "$BLUEPRINT_REPO" -n "$PORCH_NS" -o jsonpath='{.spec.git.repo}' 2>/dev/null || true)"
+  # Different backend type → intentional cross-backend blueprints; leave as-is.
+  [[ "$cur_type" != "$GIT_TYPE" ]] && return 0
   want_url="$GIT_BASE/$BLUEPRINT_REPO.git"
   [[ "$cur_url" == "$want_url" ]] && return 0
   log "Blueprints repo URL stale ($cur_url -> $want_url); re-registering"
@@ -621,7 +628,7 @@ ${_C_EXPLAIN}  This run is INTERACTIVE: it pauses between stages, explains what 
 
 
   The model:
-    • A pristine BLUEPRINT package (app-blueprint/) is published to Porch.
+    • A pristine BLUEPRINT package (kpt-pkg/) is published to Porch.
     • For each region we CLONE that blueprint, then layer small local edits
       (namespace, region, branding) — Porch tracks them as a new revision.
     • Publishing moves the revision Draft → Proposed → Published and commits
@@ -876,11 +883,11 @@ upgrade_pkg() {  # upgrade_pkg <repo> <pkg> <blueprint-name> [target-rev]
 }
 
 # Upgrade a region's app + flux packages and republish.
-# By default upgrades to the LATEST blueprints; an optional app-blueprint revision
+# By default upgrades to the LATEST blueprints; an optional kpt-pkg revision
 # (integer) pins the app package to that specific blueprint revision. An optional
 # store (astronomy|florist) re-brands the storefront during the upgrade; if
 # omitted, the region keeps its current store (preserved by Porch's 3-way merge).
-upgrade_region() {  # upgrade_region <region> [app-blueprint-rev] [store] [do-flux]
+upgrade_region() {  # upgrade_region <region> [kpt-pkg-rev] [store] [do-flux]
   local region; region="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   local target_rev="${2:-}"
   local store="${3:-}"
@@ -2024,7 +2031,7 @@ Other:
                        See BUILD_LOCAL below.
 
 Advanced (normally run automatically by a deploy — rarely needed directly):
-  blueprint            Publish local app-blueprint/ to '$BLUEPRINT_REPO'
+  blueprint            Publish local kpt-pkg/ to '$BLUEPRINT_REPO'
   blueprint-fixed      Publish the NEXT, FIXED blueprint revision by copying the
                        latest published revision in Porch and removing the 'chaos'
                        input entirely (schema + pipeline, always off) so the app
@@ -2037,7 +2044,7 @@ Advanced (normally run automatically by a deploy — rarely needed directly):
                        (alias: flux-bootstrap)
 
 GitOps model: per region there is ONE Gitea repo with two dirs — /apps (the shop,
-from app-blueprint) and /flux-config (the Flux wiring, from flux-blueprint), each a
+from kpt-pkg) and /flux-config (the Flux wiring, from flux-blueprint), each a
 Porch package. A per-region root Kustomization (<region>-flux) watches /flux-config,
 which applies /apps. Adding/updating a region = republish its packages via Porch.
 
