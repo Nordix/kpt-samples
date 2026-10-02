@@ -460,6 +460,12 @@ _STEP_NO=0
 # a positional arg; the flag wins if both are given).
 STORE_FLAG="${STORE_FLAG:-}"
 
+# Whether `teardown` should also delete the region's kind workload cluster.
+# Default OFF: teardown removes Flux objects, Porch packages/repos, and the
+# namespace, but LEAVES the kind cluster running so it can be reused. Pass the
+# global --kind flag (or set DELETE_KIND=1) to also delete the kind cluster.
+DELETE_KIND="${DELETE_KIND:-0}"
+
 # ANSI helpers (only colorize when writing to a TTY).
 if [[ -t 2 ]]; then
   _C_STEP=$'\033[1;36m'; _C_EXPLAIN=$'\033[0;36m'; _C_CMD=$'\033[1;35m'
@@ -934,23 +940,12 @@ upgrade_region() {  # upgrade_region <region> [kpt-pkg-rev] [store] [do-flux]
 
   local apr; apr="$(upgrade_pkg "$apps_repo" "$PACKAGE_NAME" "$BLUEPRINT_NAME" "$target_rev" || true)"
   if [[ -n "$apr" ]]; then
-    # Pull the upgraded draft to (1) increment the render-time `version` counter so
-    # ALL pods restart on this upgrade, and (2) optionally re-stamp storeType.
+    # Pull the upgraded draft so we can optionally re-stamp storeType. Pod
+    # restarts are handled by the blueprint itself: store/region changes roll
+    # postgres (otel-demo/catalog annotation) and chaos changes roll the
+    # chaos-affected services (otel-demo/chaos annotation) on render.
     local tmp; tmp="$(mktemp -d)"; local work="$tmp/pkg"
     p rpkg pull "$apr" "$work" >/dev/null
-
-    # Bump version counter (version-config.yaml) → bump_versioned_memory adds
-    # version*1Mi to every container on render, forcing a restart of all pods.
-    if [[ -f "$work/version-config.yaml" ]]; then
-      local _cur _next
-      _cur="$(grep -E '^[[:space:]]*version:' "$work/version-config.yaml" | head -1 | sed -E 's/.*version:[[:space:]]*"?([0-9]+)"?.*/\1/')"
-      [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
-      _next=$(( _cur + 1 ))
-      log "  bumping restart version $_cur -> $_next on $apr"
-      sed -i -E "s|^([[:space:]]*)version:.*|\1version: \"$_next\"|" "$work/version-config.yaml"
-    else
-      warn "  version-config.yaml not found in $apr; skipping restart-version bump (blueprint may predate it)"
-    fi
 
     # If a store was requested, re-stamp storeType on the upgraded draft too.
     if [[ -n "$store" ]]; then
@@ -1116,21 +1111,23 @@ push_flux_blueprint() {
 
 # Publish the NEXT, FIXED version of the app blueprint by EVOLVING the latest
 # published revision inside Porch (no second source dir on disk): copy the latest
-# revision to a new workspace, edit the draft to remove chaos (so the app runs
-# clean) + bump memory, then publish. The new revision number is chosen
-# automatically (max existing + 1), so this can be run repeatedly to produce the
-# next fixed revision each time, carrying the same set of improvements.
+# revision to a new workspace, clear the chaos value (so the app runs clean), then
+# publish. The new revision number is chosen automatically (max existing + 1), so
+# this can be run repeatedly to produce the next fixed revision each time.
 #
-# The fixes applied to the draft:
-#   * app-config.yaml         — drop the `chaos` input key (no longer configurable)
-#   * app-config-schema.yaml  — drop `chaos` from required + properties
-#   * setup-extras.yaml       — hardcode the chaos scenario to "off" (flags always
-#                               off) instead of reading it from app-config
-#   * flagd + checkout        — bump memory +10Mi (accumulating per version) so the
-#                               pod spec changes and they RESTART on upgrade
+# The fix applied to the draft:
+#   * app-config.yaml  — clear the `chaos` VALUE (chaos: <x> -> chaos:). The
+#                        blueprint already treats chaos as optional (not in the
+#                        schema's 'required') and empty/absent as "off", so an
+#                        empty value yields a clean app while keeping chaos
+#                        configurable. The schema and pipeline are left untouched.
+#
+# Pod restarts on a config change are handled by the blueprint itself:
+# store/region changes roll postgres (otel-demo/catalog annotation) and chaos
+# changes roll the chaos-affected services (otel-demo/chaos annotation) on render.
 #
 # This demonstrates blueprint evolution: a published package is copied to a new
-# revision, changed (chaos removed → a working blueprint), and re-published —
+# revision, changed (chaos cleared → a working blueprint), and re-published —
 # downstream clones can then be upgraded.
 push_blueprint_fixed() {
   require porchctl
@@ -1151,12 +1148,12 @@ push_blueprint_fixed() {
           | awk -v pkg="$name" '$2==pkg{print $4}' | grep -E '^[0-9]+$' | sort -n | tail -1)"
   ws="v$(( maxn + 1 ))"
 
-  step "Publish blueprint '$name' $ws (evolve latest: remove chaos + bump flagd/checkout)"
+  step "Publish blueprint '$name' $ws (evolve latest: clear chaos value)"
   explain "$ws is created by COPYING the latest published revision ($latest) to a" \
-          "new revision and editing it in Porch — no second source dir. Changes:" \
-          "remove the 'chaos' input entirely (app-config, schema, pipeline) so it" \
-          "always runs off, and bump flagd/checkout memory +10Mi so they restart" \
-          "on upgrade."
+          "new revision and editing it in Porch — no second source dir. Change:" \
+          "clear the 'chaos' value in app-config.yaml (chaos -> empty), which the" \
+          "blueprint treats as 'off', so the app runs clean while chaos stays" \
+          "configurable."
   if interactive; then show_pkgs "$name"; pause; fi
 
   log "Copying $latest -> new workspace $ws"
@@ -1170,12 +1167,14 @@ push_blueprint_fixed() {
   local work_orig=""
   if interactive; then work_orig="$tmp/pkg.orig"; cp -r "$work" "$work_orig"; fi
 
-  # --- v2 edit 1: drop the chaos key from app-config.yaml ---
+  # --- fixed-revision edit: REMOVE the chaos key from app-config.yaml ---
+  # This is the demo's point: the new blueprint revision drops `chaos` entirely.
+  # On `rpkg upgrade` (Porch 3-way merge), removing the field upstream propagates
+  # DOWN — each region's downstream app-config loses its chaos value too
+  # ("upstream wins"). The blueprint already treats absent chaos as "off" (schema
+  # doesn't require it; setup-extras defaults it), so the result is a clean app.
   if [[ -f "$work/app-config.yaml" ]]; then
-    log "Removing 'chaos' key from app-config.yaml"
-    # YAML-aware removal: delete data.chaos regardless of block or flow style,
-    # and strip the chaos doc-comment lines. (A line-based sed misses the key
-    # when `data` is written inline as `{... chaos: x}`.)
+    log "Removing the 'chaos' key from app-config.yaml (upstream drops it; merge removes it downstream)"
     python3 - "$work/app-config.yaml" <<'PY'
 import re, sys
 p = sys.argv[1]
@@ -1183,13 +1182,13 @@ lines = open(p).read().split("\n")
 out = []
 for ln in lines:
     stripped = ln.strip()
-    # drop chaos doc-comment lines
+    # Drop chaos doc-comment lines (the key's description in the header block).
     if stripped.startswith("#") and ("chaos" in stripped or "broken-catalog | memory-leak" in stripped):
         continue
-    # drop a block-style `chaos:` data key on its own line
-    if re.match(r'^\s*chaos:\s', ln) or re.match(r'^\s*chaos:\s*$', ln):
+    # Drop a block-style `chaos:` data key on its own line (with or without value).
+    if re.match(r'^\s*chaos:\s*(\S.*)?$', ln):
         continue
-    # drop chaos from an inline/flow-style data map: {a: 1, chaos: x, b: 2}
+    # Drop chaos from an inline/flow-style data map: {a: 1, chaos: x, b: 2}
     if "{" in ln and "chaos:" in ln:
         ln = re.sub(r',?\s*chaos:\s*[^,}]+', '', ln)
     out.append(ln)
@@ -1197,62 +1196,16 @@ open(p, "w").write("\n".join(out))
 PY
   fi
 
-  # --- v2 edit 2: drop chaos from the schema (required + properties) ---
-  if [[ -f "$work/app-config-schema.yaml" ]]; then
-    log "Removing 'chaos' from app-config-schema.yaml"
-    # remove the "- chaos" required entry
-    sed -i '/^[[:space:]]*-[[:space:]]*chaos[[:space:]]*$/d' "$work/app-config-schema.yaml"
-    # remove the chaos property block (the 'chaos:' key and its two indented lines:
-    # 'type: string' and the 'enum: [...]' line)
-    sed -i '/^[[:space:]]*chaos:[[:space:]]*$/,+2d' "$work/app-config-schema.yaml"
-  fi
-
-  # --- v2 edit 3: hardcode chaos scenario to "off" in setup-extras.yaml ---
-  # Replace the block that reads chaos from app-config with a fixed scenario.
-  if [[ -f "$work/setup-extras.yaml" ]]; then
-    log "Hardcoding chaos scenario to 'off' in setup-extras.yaml"
-    python3 - "$work/setup-extras.yaml" <<'PY'
-import re, sys
-p = sys.argv[1]
-s = open(p).read()
-# Replace the whole config-reading region — from the initial `scenario = "off"`
-# default line through the trailing fail() — with a single hardcoded assignment,
-# so v2 has exactly one `scenario = "off"` (no redundant duplicate).
-#     scenario = "off"
-#
-#     # Read chaos scenario from config
-#     for r in resources:
-#       if krmfn.match_gvk(... "app-config"):
-#         scenario = r.get("data", {}).get("chaos", "off")
-#
-#     if scenario == None:
-#       scenario = "off"
-#     if scenario == "":
-#       fail("chaos cannot be empty in app-config")
-pat = re.compile(
-    r'[ \t]*scenario = "off"\n'
-    r'(?:.*\n)*?'
-    r'[ \t]*fail\("chaos cannot be empty in app-config"\)\n'
-)
-repl = '    # v2: chaos removed as a configurable input; always run with it off.\n    scenario = "off"\n'
-s2, n = pat.subn(repl, s, count=1)
-if n == 0:
-    sys.stderr.write("WARN: chaos read block not found in setup-extras.yaml; left unchanged\n")
-open(p, "w").write(s2)
-PY
-  fi
-
-  # NOTE: the old flagd/checkout +10Mi memory bump was removed. Forcing pod
-  # restarts on upgrade is now handled uniformly for ALL pods by the render-time
-  # `version` counter (version-config ConfigMap + bump_versioned_memory in
-  # setup-extras.yaml), which deploy.sh increments on each upgrade.
+  # NOTE: restarts on a config change are handled by the blueprint's annotation
+  # stamping — store/region rolls postgres (otel-demo/catalog) and chaos rolls the
+  # chaos-affected services (otel-demo/chaos) on render. No global version bump.
 
   if interactive && [[ -n "$work_orig" ]]; then
-    show_diff "$ws changes (chaos removed + flagd/checkout +10Mi) vs previous" "$work_orig" "$work"
-    explain "$ws delta: chaos removed from the input/schema/pipeline, and" \
-            "flagd/checkout memory bumped +10Mi so they RESTART on upgrade (clears" \
-            "flagd's stale config + checkout's stuck gRPC resolver)." \
-            "Branding/region/profile unchanged."
+    show_diff "$ws changes (chaos key removed) vs previous" "$work_orig" "$work"
+    explain "$ws delta: the 'chaos' key is REMOVED from app-config.yaml. On upgrade," \
+            "Porch's 3-way merge propagates the removal downstream — regions lose" \
+            "their chaos value too (upstream wins). The pipeline treats absent" \
+            "chaos as 'off'. Branding/region/profile unchanged."
     pause
   fi
 
@@ -1996,9 +1949,10 @@ Commands:
   all                  Deploy all three regions (ireland, sweden, hungary)
   status               Show blueprints, app + flux packages, and Flux status
   teardown <region>    Tear down one region (Flux root, Porch packages + repo
-                       registrations, namespace, RBAC). The backing git repo is
-                       left intact.
-  teardown --all       Tear down all regions.  Flags: --blueprint --flux --images
+                       registrations, namespace, RBAC). The backing git repo AND
+                       the region's kind cluster are left intact by default; pass
+                       --kind to also delete the kind cluster.
+  teardown --all       Tear down all regions.  Flags: --kind --blueprint --flux --images
   teardown --blueprint Delete ONLY the published blueprints + the blueprints repo
                        registration (no region teardown; backing git repo kept)
   teardown --flux      Uninstall ONLY the Flux controllers (no region teardown)
@@ -2059,6 +2013,12 @@ Interactive / demo mode (works with any command, e.g. a deploy):
                        recordings/hands-free demos.
   --step-delay <secs>  Auto-advance delay (default 2; implies --auto).
                        (Env equivalents: INTERACTIVE=1, AUTO=1, STEP_DELAY=<secs>.)
+
+Teardown options:
+  --kind               On teardown, ALSO delete the region's kind workload
+                       cluster. By default teardown preserves the kind cluster
+                       (only Flux/Porch/namespace are removed) so it can be
+                       reused. (Env equivalent: DELETE_KIND=1.)
 
 Git backend (works with any command, e.g. a deploy):
   --gitBackend <gitea|gitlab>
@@ -2192,9 +2152,15 @@ teardown_target() {  # teardown_target <repo>
   kubectl --context "$MGMT_CONTEXT" delete ns "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
   # 4. Delete the region workload cluster entirely (removes all workloads + its RBAC).
-  if kind get clusters 2>/dev/null | grep -qx "$region_cl"; then
-    log "  deleting region kind cluster $region_cl"
-    kind delete cluster --name "$region_cl" >/dev/null 2>&1 || true
+  #    OFF by default — the kind cluster is preserved so it can be reused. Pass
+  #    --kind (or DELETE_KIND=1) to also delete it.
+  if [[ "$DELETE_KIND" == "1" ]]; then
+    if kind get clusters 2>/dev/null | grep -qx "$region_cl"; then
+      log "  deleting region kind cluster $region_cl (--kind)"
+      kind delete cluster --name "$region_cl" >/dev/null 2>&1 || true
+    fi
+  else
+    log "  keeping region kind cluster $region_cl (pass --kind to delete it)"
   fi
   log "Teardown complete for $region"
 }
@@ -2237,12 +2203,15 @@ remove_images() {
 #   -i | --interactive   guided walkthrough with pauses + narration
 #   --auto               interactive narration, but auto-advance (no Enter needed)
 #   --step-delay <secs>  auto-advance delay (implies --auto)
+#   --kind               on teardown, ALSO delete the region's kind cluster
+#                        (default: the kind cluster is preserved)
 _args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -i|--interactive) INTERACTIVE=1 ;;
     --auto)           INTERACTIVE=1; AUTO=1 ;;
     --step-delay)     INTERACTIVE=1; AUTO=1; STEP_DELAY="${2:-2}"; shift ;;
+    --kind)           DELETE_KIND=1 ;;
     --gitBackend|--git-backend)
                       GIT_BACKEND="${2:-}"; GIT_BACKEND_EXPLICIT=1; shift ;;
     --gitBackend=*|--git-backend=*)

@@ -45,7 +45,7 @@ source: |
     "ad": "300Mi",
     "email": "100Mi",
     "accounting": "120Mi",
-    "fraud-detection": "300Mi",
+    "fraud-detection": "400Mi",
     "image-provider": "50Mi",
     "load-generator": "1500Mi",
     "product-reviews": "100Mi",
@@ -413,6 +413,44 @@ source: |
 
     flags_to_enable = chaos_matrix[scenario]
 
+    # Stamp the active chaos scenario onto every chaos-capable service's pod
+    # template. A flagd ConfigMap change propagates at runtime but does NOT
+    # restart the pods; stamping the scenario (same value on all of them) changes
+    # the pod spec whenever chaos changes, so `kpt live apply`/Flux rolls exactly
+    # those services. When chaos is off/absent the value is "off" (never removed),
+    # so switching to/from any scenario — including off — rolls them consistently.
+    #
+    # Services each scenario needs ROLLED. This is NOT just the flag-named service:
+    # a scenario can require restarting downstream callers that hold stale state.
+    # e.g. payment-outage also rolls `checkout`, which calls payment and otherwise
+    # keeps a stuck gRPC connection/resolver to the failed payment service.
+    scenario_to_services = {
+      "off": [],
+      "payment-outage": ["payment", "checkout", "cart", "flagd"],
+      "high-load": ["load-generator", "ad", "kafka"],
+      "broken-catalog": ["product-catalog", "recommendation"],
+      "memory-leak": ["email", "ad"],
+    }
+    # The full chaos-capable set = union across all scenarios, so leaving any
+    # scenario (or going to off) also rolls everything back to the "off" stamp.
+    chaos_services = []
+    for _sc, _svcs in scenario_to_services.items():
+      for _svc in _svcs:
+        if _svc not in chaos_services:
+          chaos_services.append(_svc)
+
+    kinds = ["Deployment", "StatefulSet", "DaemonSet"]
+    for r in resources:
+      if r.get("kind", "") not in kinds:
+        continue
+      name = r.get("metadata", {}).get("name", "")
+      if name not in chaos_services:
+        continue
+      template = r.setdefault("spec", {}).setdefault("template", {})
+      meta = template.setdefault("metadata", {})
+      annotations = meta.setdefault("annotations", {})
+      annotations["otel-demo/chaos"] = scenario
+
     # Gather all chaos flags we know about
     all_chaos_flags = []
     for scenario_name, scenario_flags in chaos_matrix.items():
@@ -638,50 +676,9 @@ source: |
     fix_collector_lease_ns(resources, ns)
 
   # ═══════════════════════════════════════════════════════════════════════
-  # Versioned memory bump — a uniform restart mechanism.
-  #
-  # Reads an integer `version` from the version-config ConfigMap and adds
-  # version * 1Mi to EVERY container's memory limit. Runs AFTER setup_profile
-  # (which resets limits to their baseline), so the bump lands on top of the
-  # baseline and is deterministic for a given version. deploy.sh increments
-  # `version` on each upgrade, so every upgrade changes every pod spec → all pods
-  # RESTART. Replaces the old per-service flagd/checkout +10Mi bump.
-  #
-  # Containers with no memory limit (e.g. flagd-ui, llm) are left untouched — we
-  # never introduce a limit, only bump an existing one.
-  # ═══════════════════════════════════════════════════════════════════════
-  def bump_versioned_memory(resources):
-    version = 0
-    for r in resources:
-      if krmfn.match_gvk(r, "v1", "ConfigMap") and krmfn.match_name(r, "version-config"):
-        raw = r.get("data", {}).get("version", "0")
-        if raw == None or raw == "":
-          raw = "0"
-        version = int(raw)
-        break
-    if version <= 0:
-      return  # version 0 (or unset) → no bump
-
-    kinds = ["Deployment", "StatefulSet", "DaemonSet"]
-    for r in resources:
-      if r.get("kind", "") not in kinds:
-        continue
-      pod = r.get("spec", {}).get("template", {}).get("spec", {})
-      for c in pod.get("containers", []):
-        res = c.get("resources", None)
-        if not res:
-          continue
-        limits = res.get("limits", None)
-        if not limits or "memory" not in limits:
-          continue
-        mb = parse_memory(limits["memory"])
-        limits["memory"] = format_memory(mb + version)
-
-  # ═══════════════════════════════════════════════════════════════════════
   # Dispatch — same order as the original 3 pipeline steps.
   # ═══════════════════════════════════════════════════════════════════════
   _items = ctx.resource_list["items"]
   setup_profile(_items)
-  bump_versioned_memory(_items)
   setup_chaos(_items)
   setup_cluster_scope(_items)
