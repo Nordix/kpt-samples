@@ -81,11 +81,74 @@ GIT_BACKEND_EXPLICIT="${GIT_BACKEND:+1}"; GIT_BACKEND_EXPLICIT="${GIT_BACKEND_EX
 GIT_BACKEND="${GIT_BACKEND:-gitea}"
 
 # --- Gitea backend defaults ---
+# Capture whether the user explicitly pinned the Gitea URLs BEFORE applying the
+# defaults, so auto-discovery (below) only kicks in when they didn't.
+GITEA_BASE_EXPLICIT="${GITEA_BASE:+1}"; GITEA_BASE_EXPLICIT="${GITEA_BASE_EXPLICIT:-0}"
+GITEA_API_EXPLICIT="${GITEA_API:+1}";   GITEA_API_EXPLICIT="${GITEA_API_EXPLICIT:-0}"
 GITEA_BASE="${GITEA_BASE:-http://172.18.255.204:3000/porch}"   # <base>/<repo>.git (in-cluster LB IP)
 GITEA_API="${GITEA_API:-http://172.18.255.204:3000/api/v1}"
 GITEA_USER="${GITEA_USER:-porch}"
 GITEA_PASS="${GITEA_PASS:-secret}"
 GITEA_SECRET="${GITEA_SECRET:-gitea}"
+# Where to discover the Gitea LoadBalancer IP (namespace/service/port). The
+# default service is 'gitea-lb' in the 'gitea' namespace exposing port 3000.
+GITEA_LB_NS="${GITEA_LB_NS:-gitea}"
+GITEA_LB_SVC="${GITEA_LB_SVC:-gitea-lb}"
+GITEA_LB_PORT="${GITEA_LB_PORT:-3000}"
+GITEA_PATH="${GITEA_PATH:-porch}"   # URL path segment under the host (<base>/<repo>.git)
+# Internal: set once discover_gitea_lb_ip has run, so the (twice-called)
+# apply_git_backend doesn't repeat the lookup/log.
+_GITEA_LB_DISCOVERED=0
+
+# discover_gitea_lb_ip — resolve the Gitea LoadBalancer IP live from the cluster
+# and rebuild GITEA_BASE/GITEA_API from it, so the script adapts to whatever IP
+# MetalLB (or the environment) actually assigned instead of a baked-in default.
+# No-op if the user explicitly set GITEA_BASE/GITEA_API (their choice wins), if
+# kubectl isn't available, or if the service/IP can't be resolved (keeps the
+# existing default and warns). Runs its lookup only once per invocation.
+discover_gitea_lb_ip() {
+  # Only discover once — apply_git_backend calls this on each run.
+  [[ "$_GITEA_LB_DISCOVERED" == "1" ]] && return 0
+  _GITEA_LB_DISCOVERED=1
+  # Respect an explicit override of either URL — don't second-guess the user.
+  [[ "$GITEA_BASE_EXPLICIT" == "1" || "$GITEA_API_EXPLICIT" == "1" ]] && return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+
+  local ip
+  ip="$(kubectl get svc "$GITEA_LB_SVC" -n "$GITEA_LB_NS" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+  # Fall back to a hostname-based ingress if the LB reports a host instead of an IP.
+  [[ -z "$ip" ]] && ip="$(kubectl get svc "$GITEA_LB_SVC" -n "$GITEA_LB_NS" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+
+  if [[ -z "$ip" ]]; then
+    warn "could not discover Gitea LB IP from $GITEA_LB_NS/$GITEA_LB_SVC; using default $GITEA_BASE"
+    return 0
+  fi
+
+  # Discover the HTTP port from the service rather than assuming it. Prefer a port
+  # named 'http'/'web'; else the one whose port matches GITEA_LB_PORT; else the
+  # first port. Falls back to GITEA_LB_PORT if the service can't be read.
+  local port
+  port="$(kubectl get svc "$GITEA_LB_SVC" -n "$GITEA_LB_NS" -o jsonpath='{range .spec.ports[?(@.name=="http")]}{.port}{end}{range .spec.ports[?(@.name=="web")]}{.port}{end}' 2>/dev/null | tr -d '[:space:]' || true)"
+  # If no named http/web port, pick the port equal to GITEA_LB_PORT if present.
+  if [[ -z "$port" ]]; then
+    port="$(kubectl get svc "$GITEA_LB_SVC" -n "$GITEA_LB_NS" \
+      -o jsonpath="{range .spec.ports[?(@.port==$GITEA_LB_PORT)]}{.port}{end}" 2>/dev/null || true)"
+  fi
+  # Last resort: first port on the service.
+  [[ -z "$port" ]] && port="$(kubectl get svc "$GITEA_LB_SVC" -n "$GITEA_LB_NS" \
+      -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+  # If the service couldn't be read at all, keep the configured default.
+  [[ -z "$port" ]] && port="$GITEA_LB_PORT"
+
+  local host="http://${ip}:${port}"
+  if [[ "$GITEA_BASE" != "$host/$GITEA_PATH" ]]; then
+    log "Discovered Gitea LB $ip:$port (svc $GITEA_LB_NS/$GITEA_LB_SVC) — using $host"
+  fi
+  GITEA_BASE="$host/$GITEA_PATH"
+  GITEA_API="$host/api/v1"
+}
 
 # --- GitLab backend defaults (see ~/work/repo/v1alpha1/gitlab/*.yaml) ---
 # GitLab exposes git over its web port; repos live under <base>/<repo>.git and
@@ -151,6 +214,9 @@ _GIT_SECRET_ENV="${GIT_SECRET:-}"
 apply_git_backend() {
   case "$GIT_BACKEND" in
     gitea)
+      # Resolve the Gitea LB IP live (no-op if explicitly overridden or
+      # unresolvable) so GIT_BASE/GIT_API reflect the actual cluster address.
+      discover_gitea_lb_ip
       GIT_BASE="${GITEA_BASE}"
       GIT_API="${GITEA_API}"
       GIT_USER="${GITEA_USER}"
@@ -267,7 +333,11 @@ assert_repo_backend() {
   local existing_type existing_repo
   existing_type="$(kubectl get repository "$name" -n "$PORCH_NS" -o jsonpath='{.spec.type}' 2>/dev/null)"
   existing_repo="$(kubectl get repository "$name" -n "$PORCH_NS" -o jsonpath='{.spec.git.repo}' 2>/dev/null)"
-  [[ "$existing_type" == "$GIT_TYPE" && "$existing_repo" == "$GIT_BASE/$git_repo.git" ]] && return 0
+  # Match on backend TYPE only. A same-type URL difference (e.g. the Gitea LB
+  # IP/host moved) is NOT a conflict — ensure_repo_registered re-registers it.
+  # Only a different type (gitea <-> gitlab) is a real "deployed on another
+  # backend" conflict that requires a teardown first.
+  [[ "$existing_type" == "$GIT_TYPE" ]] && return 0
   die "Porch repository '$name' is already registered on a different git backend"$'\n'\
 "       existing : type=$existing_type  repo=$existing_repo"$'\n'\
 "       requested: type=$GIT_TYPE  repo=$GIT_BASE/$git_repo.git  (--gitBackend $GIT_BACKEND)"$'\n'\
@@ -317,6 +387,23 @@ resolve_blueprint_repo() {
     gitlab) BLUEPRINT_REPO="blueprints-gitlab" ;;
     *)      BLUEPRINT_REPO="blueprints" ;;
   esac
+}
+
+# reregister_blueprint_repo_if_stale — if the resolved blueprints Repository exists
+# but its git URL no longer matches the current GIT_BASE (e.g. the Gitea LB IP
+# changed), re-register it so Porch can reach it again. The backing Gitea repo
+# name equals BLUEPRINT_REPO and it lives at directory '/'. No-op when the repo is
+# absent (nothing to repoint) or already current (ensure_repo_registered reuses).
+reregister_blueprint_repo_if_stale() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  kubectl get repository "$BLUEPRINT_REPO" -n "$PORCH_NS" >/dev/null 2>&1 || return 0
+  local cur_url want_url
+  cur_url="$(kubectl get repository "$BLUEPRINT_REPO" -n "$PORCH_NS" -o jsonpath='{.spec.git.repo}' 2>/dev/null || true)"
+  want_url="$GIT_BASE/$BLUEPRINT_REPO.git"
+  [[ "$cur_url" == "$want_url" ]] && return 0
+  log "Blueprints repo URL stale ($cur_url -> $want_url); re-registering"
+  ensure_git_secret
+  ensure_repo_registered "$BLUEPRINT_REPO" "$BLUEPRINT_REPO" "/" false
 }
 
 # detect_region_backend — infer a region's git backend from its already-registered
@@ -685,6 +772,7 @@ wait_lifecycle() {  # wait_lifecycle <pkgrev> <Draft|Proposed|Published>
 
 publish() {  # publish <pkgrev>
   local pr="$1"
+  local rc=0
   if [[ "$GIT_BACKEND" == "gitlab" ]]; then
     explain "Lifecycle (GitLab): this Draft revision opens a Merge Request, marks it" \
             "ready (Proposed), then approves it (merges the MR) → Published." \
@@ -698,17 +786,18 @@ publish() {  # publish <pkgrev>
     sleep 2
     run_visible p rpkg propose "$pr" >/dev/null
     sleep 2
-    run_visible p rpkg approve "$pr" >/dev/null
+    run_visible p rpkg approve "$pr" >/dev/null || rc=$?
     show_pkgs
-    return 0
+    return $rc
   fi
   explain "Lifecycle: this Draft revision will be Proposed, then Approved →" \
           "Published. Publishing is what commits the server-rendered KRM to git." \
           "  $pr : Draft → Proposed → Published"
-  run_visible p rpkg propose "$pr" >/dev/null
+  run_visible p rpkg propose "$pr" >/dev/null || rc=$?
   sleep 2
-  run_visible p rpkg approve "$pr" >/dev/null
+  run_visible p rpkg approve "$pr" >/dev/null || rc=$?
   show_pkgs
+  return $rc
 }
 
 # Return the k8s name of an editable (Draft) revision of <repo>/<pkg>, creating one
@@ -804,9 +893,22 @@ upgrade_region() {  # upgrade_region <region> [app-blueprint-rev] [store] [do-fl
   # publish/MR flow, and git secret) even if --gitBackend wasn't passed.
   detect_region_backend "$region"
   resolve_blueprint_repo
+  # Repoint the shared blueprints repo too if its URL went stale (IP change),
+  # since the upgrade reads the blueprint from it.
+  reregister_blueprint_repo_if_stale
   # Ensure a usable GitLab token for the publish/MR steps (no-op for gitea, and
   # idempotent if detect_region_backend already resolved one).
   [[ "$GIT_BACKEND" == "gitlab" ]] && ensure_gitlab_token
+
+  # Re-register the region's Porch repositories against the CURRENT git URL before
+  # publishing. The Gitea LB IP can change between runs (auto-discovered into
+  # GIT_BASE); without this, Porch would still push to the stale URL recorded on
+  # the Repository CR and fail with "no route to host". ensure_repo_registered is
+  # idempotent — it reuses the repo when the URL already matches, and recreates it
+  # (so Porch re-reads the new URL) when it differs.
+  ensure_git_secret
+  ensure_repo_registered "$apps_repo" "$region" "/apps"
+  ensure_repo_registered "$flux_repo" "$region" "/flux-config"
 
   # Validate store if provided.
   if [[ -n "$store" ]]; then
@@ -860,7 +962,11 @@ upgrade_region() {  # upgrade_region <region> [app-blueprint-rev] [store] [do-fl
 
     p rpkg push "$apr" "$work" >/dev/null
     rm -rf "$tmp"
-    publish "$apr" && log "  app upgraded + published: $apr"
+    if publish "$apr"; then
+      log "  app upgraded + published: $apr"
+    else
+      die "app publish FAILED for $apr (see error above). The region's Porch repo may point at a stale git URL — re-run the upgrade (repos are re-registered at the start) or 'deploy $region' to repoint."
+    fi
   fi
 
   # Flux wiring upgrade is OPTIONAL — the flux-config rarely changes, so by default
@@ -1622,25 +1728,32 @@ ensure_repo_registered() {  # ensure_repo_registered <porch-name> <git-repo> <di
     cur_url="$(kubectl get repository "$name" -n "$PORCH_NS" -o jsonpath='{.spec.git.repo}' 2>/dev/null)"
     cur_secret="$(kubectl get repository "$name" -n "$PORCH_NS" -o jsonpath='{.spec.git.secretRef.name}' 2>/dev/null)"
 
-    # Cross-backend mismatch (different type or a different git server): this
-    # region was deployed on another backend. Do NOT silently repoint it — fail
-    # fast and tell the user to tear it down first (preserves the earlier
-    # backend-consistency contract). assert_repo_backend dies with guidance.
-    if [[ "$cur_type" != "$GIT_TYPE" || "$cur_url" != "$want_url" ]]; then
+    # Decide how to handle an existing Repository:
+    #   * Different backend TYPE (gitea <-> gitlab): genuine conflict — this was
+    #     deployed on another backend. Fail fast via assert_repo_backend.
+    #   * Same type but a different git URL (e.g. the Gitea LB IP/host changed):
+    #     NOT a conflict — the git server just moved. Re-register so Porch points
+    #     at the new URL (delete + recreate below, since Porch caches git state).
+    #   * Same type + same URL + same secret: reuse as-is.
+    local need_recreate=0 recreate_reason=""
+    if [[ "$cur_type" != "$GIT_TYPE" ]]; then
       assert_repo_backend "$name" "$git_repo"
-    fi
-
-    # Fully matches the selected backend (type + URL + secret binding) → REUSE it
-    # as-is. No churn on re-runs.
-    if [[ "$cur_secret" == "$GIT_SECRET" ]]; then
+    elif [[ "$cur_url" != "$want_url" ]]; then
+      need_recreate=1
+      recreate_reason="url '$cur_url' -> '$want_url'"
+    elif [[ "$cur_secret" != "$GIT_SECRET" ]]; then
+      # Same backend/URL but bound to a DIFFERENT secret.
+      need_recreate=1
+      recreate_reason="secret '$cur_secret' -> '$GIT_SECRET'"
+    else
+      # Fully matches (type + URL + secret binding) → REUSE as-is. No churn.
       log "  reusing existing Repository '$name' (type=$GIT_TYPE, secret=$GIT_SECRET)"
       return 0
     fi
 
-    # Same backend/URL but bound to a DIFFERENT secret. Porch caches git
-    # credentials on the Repository object, so switching the secret binding won't
-    # take effect by patching — delete + recreate so Porch re-reads it.
-    log "  recreating Repository '$name' (secret '$cur_secret' -> '$GIT_SECRET')"
+    # Porch caches git URL/credentials on the Repository object, so changing them
+    # won't take effect by patching — delete + recreate so Porch re-reads them.
+    log "  recreating Repository '$name' ($recreate_reason)"
     kubectl delete repository "$name" -n "$PORCH_NS" --ignore-not-found >/dev/null 2>&1 || true
     sleep 2
   fi
